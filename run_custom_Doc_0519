@@ -1,0 +1,1400 @@
+from __future__ import absolute_import
+
+import re
+import os
+
+import tqdm
+import json
+import pickle
+
+import modeling
+import optimization
+
+import tensorflow as tf
+from tensorflow import keras
+import numpy as np
+import random
+import collections
+import tokenization
+from collections import Counter
+
+bert_model_dir = r'F:\NLP\ALBERT\albert_base_v1'
+file_dir = r'F:\NLP\NRE\NRE_Benchmark\custom_data'
+
+train_file = os.path.join(file_dir, 'train_distant.json')
+eval_file = os.path.join(file_dir, 'dev.json')
+test_file = os.path.join(file_dir,'test.json')
+# glove_file = r'F:\NLP\glove\glove.840B.300d.txt'
+
+do_lower_case = True
+
+iterations_per_loop = 1000
+
+train_batch_size = 5
+eval_batch_size = 5
+num_train_epochs = 20
+warmup_proportion = 0.1
+learning_rate = 5e-5
+predict_batch_size = 1
+
+max_sents = 21
+p = 1
+q_=0.75
+
+#train_len = 3053
+train_len = 101873
+#train_len = 93071
+eval_len = 1000
+test_len = 1000
+
+save_checkpoints_steps = int(train_len / train_batch_size)
+
+do_train = True
+do_predict = False
+do_eval = True
+
+bert_config_file = os.path.join(bert_model_dir, 'albert_config.json')
+
+np.random.seed(1)
+master = None
+num_tpu_cores = 8
+
+ner_emb = 30
+coref_emb = 30
+dep_emb = 30
+sent_dist_emb = 30
+dim_sent = 30
+
+coref_maxlen = 60
+
+sent_rel_max = 1800
+token_max_len = 511
+max_seq_len = 511
+
+dim = [500, 250, 128, 105]
+dim_f = 30
+
+with open(os.path.join(file_dir, 'rel_to_ind.json')) as f:
+    rel_to_ind = json.load(f)
+ind_to_rel = {i: w for w, i in rel_to_ind.items()}
+with open(os.path.join(file_dir, 'type_to_ind.json')) as f:
+    type_to_ind = json.load(f)
+ind_to_type = {i: w for w, i in type_to_ind.items()}
+
+dis2idx = np.zeros((max_seq_len,), dtype=np.int64)
+dis2idx[1] = 1
+for i in range(2, 10):
+    dis2idx[(2 ** (i - 1)):] = i
+
+vocab_file = os.path.join(bert_model_dir, '30k-clean.vocab')
+
+init_checkpoint = os.path.join(bert_model_dir, 'model.ckpt-best')
+use_tpu = False
+use_one_hot_embeddings = False
+
+output_dir = r'./output_multi_test_0519'
+
+tokenizer = tokenization.FullTokenizer(
+    vocab_file=vocab_file, do_lower_case=True, spm_model_file=os.path.join(bert_model_dir, '30k-clean.model'))
+
+
+def create_vocab_dict(words, no_oov=True):
+    from collections import Counter
+    word_to_count = Counter(words)
+    word_and_count = sorted([(w, v) for w, v in word_to_count.items()], key=lambda x: x[1], reverse=True)
+    if no_oov:
+        word_to_ind = {w: i for i, (w, _) in enumerate(word_and_count)}
+        ind_to_word = {i: w for i, (w, _) in enumerate(word_and_count)}
+    else:
+        word_to_ind = {w: i for i, (w, _) in enumerate(word_and_count, 2)}
+        ind_to_word = {i: w for i, (w, _) in enumerate(word_and_count, 2)}
+    return word_to_ind, ind_to_word
+
+
+class InputExample():
+    def __init__(self, index, title, sent_coref_id, sent_ner_id, sent_org_token,input_ids,input_mask,input_type_ids, rels=None):
+        self.index = index
+        self.title = title
+        self.sent_coref_id = sent_coref_id
+        self.sent_ner_id = sent_ner_id
+        self.sent_org_token = sent_org_token
+        self.input_ids = input_ids
+        self.input_mask = input_mask
+        self.input_type_ids = input_type_ids
+        self.rels = rels
+
+    def __repr__(self):
+        return 'index :%d, title :%s, rel_n :%d, token_n :%d' % \
+               (self.index, self.title, len(self.rels), len(self.sent_org_token))
+
+
+class InputFeature():
+    def __init__(self, index,
+                 title,
+                 tokens,
+                 input_ids,
+                 input_mask,
+                 input_type_ids,
+                 h_pos_nums=None,
+                 h_pos_relid=None,
+                 h_pos_n=None,
+                 h_map_vs=None,
+                 t_pos_nums=None,
+                 t_pos_relid=None,
+                 t_pos_n=None,
+                 t_map_vs=None,
+                 h_tok_pos_nums=None,
+                 h_tok_pos_relid=None,
+                 h_tok_pos_n=None,
+                 h_tok_map_vs=None,
+                 t_tok_pos_nums=None,
+                 t_tok_pos_relid=None,
+                 t_tok_pos_n=None,
+                 t_tok_map_vs=None,
+                 label_indexs=None,
+                 label_relid=None,
+                 rel_label_n=None,
+                 h_type_indexs=None,
+                 t_type_indexs=None,
+                 h_indexs=None,
+                 t_indexs=None,
+                 h_sent_pos=None,
+                 t_sent_pos=None,
+                 sent_coref_id=None,
+                 sent_ner_id=None,
+                 sent_dist=None,
+                 rel_n=None):
+        self.index = index
+        self.title = title
+        self.tokens = tokens
+        self.input_ids = input_ids
+        self.input_mask = input_mask
+        self.input_type_ids = input_type_ids
+
+        self.h_pos_nums = h_pos_nums
+        self.h_pos_relid = h_pos_relid
+        self.h_pos_n = h_pos_n
+        self.h_map_vs = h_map_vs
+        self.t_pos_nums = t_pos_nums
+        self.t_pos_relid = t_pos_relid
+        self.t_pos_n = t_pos_n
+        self.t_map_vs = t_map_vs
+
+        self.h_tok_pos_nums = h_tok_pos_nums
+        self.h_tok_pos_relid = h_tok_pos_relid
+        self.h_tok_pos_n = h_tok_pos_n
+        self.h_tok_map_vs = h_tok_map_vs
+        self.t_tok_pos_nums = t_tok_pos_nums
+        self.t_tok_pos_relid = t_tok_pos_relid
+        self.t_tok_pos_n = t_tok_pos_n
+        self.t_tok_map_vs = t_tok_map_vs
+
+        self.label_indexs = label_indexs
+        self.label_relid = label_relid
+        self.rel_label_n = rel_label_n
+        self.h_type_indexs = h_type_indexs
+        self.t_type_indexs = t_type_indexs
+        self.h_indexs = h_indexs
+        self.t_indexs = t_indexs
+        self.h_sent_pos = h_sent_pos
+        self.t_sent_pos = t_sent_pos
+        self.sent_coref_id = sent_coref_id
+        self.sent_ner_id = sent_ner_id
+        self.sent_dist = sent_dist
+        self.rel_n = rel_n
+
+    def __repr__(self):
+        return 'index :%d, title :%s' % (self.index, self.title)
+
+
+def read_examples_and_convert_features(file, output_fn, is_train=True, is_validation=False, p=0.0, ):
+    print('***** begin to read data *****')
+    np.random.seed(12345)
+    raw_datas = []
+    with open(file, 'r') as f:
+        data = json.load(f)
+        for temp in tqdm.tqdm(data):
+            if sum(len(st) for st in temp['sents']) < token_max_len or not (is_train or is_validation):
+                raw_datas.append(temp)
+    print('file %s readding complete, processing raw data.' % file)
+
+    for index, temp in tqdm.tqdm(enumerate(raw_datas)):
+        title = temp['title']
+        sent_start_pos = np.cumsum([0] + [len(st) for st in temp['sents']])
+        if do_lower_case:
+            sent_org_token = [t.lower() for st in temp['sents'] for t in st]
+        else:
+            sent_org_token = [t for st in temp['sents'] for t in st]
+        sent_coref_id = np.zeros((token_max_len,))
+        sent_ner_id = np.zeros((token_max_len,))
+        for idx, en in enumerate(temp['vertexSet']):
+            for ment in en:
+                em_pos = np.array(ment['pos']) + sent_start_pos[ment['sent_id']]
+                sent_coref_id[em_pos[0]:em_pos[1]] = idx + 1
+                sent_ner_id[em_pos[0]:em_pos[1]] = type_to_ind[ment['type']] + 1
+        sent_coref_id = sent_coref_id.astype(np.int).tolist()
+        sent_ner_id = sent_ner_id.astype(np.int).tolist()
+
+        tokens = []
+        orig_to_tok_map = []
+        input_type_ids = []
+        tokens.append("[CLS]")
+        input_type_ids.append(0)
+        for token in sent_org_token:
+            orig_to_tok_map.append(len(tokens))
+            temp_token = tokenizer.tokenize(token)
+            tokens.extend(temp_token)
+            input_type_ids.extend([0] * len(temp_token))
+        # The mask has 1 for real tokens and 0 for padding tokens. Only real
+        # tokens are attended to.
+        orig_to_tok_map.append(len(tokens))
+        orig_to_tok_map.append(len(tokens))
+        tokens = tokens[:max_seq_len - 1]
+        input_type_ids = input_type_ids[:max_seq_len - 1]
+        tokens.append("[SEP]")
+
+        input_type_ids.append(0)
+
+        input_ids = tokenizer.convert_tokens_to_ids(tokens)
+
+        # The mask has 1 for real tokens and 0 for padding tokens. Only real
+        # tokens are attended to.
+        input_mask = [1] * len(input_ids)
+
+        # Zero-pad up to the sequence length.
+        while len(input_ids) < max_seq_len:
+            input_ids.append(0)
+            input_mask.append(0)
+            input_type_ids.append(0)
+
+        assert len(input_ids) == max_seq_len
+        assert len(input_mask) == max_seq_len
+        assert len(input_type_ids) == max_seq_len
+
+
+        rels = []
+        entity_n = len(temp['vertexSet'])
+        if is_train or is_validation:
+            h_t_dict = {}
+            for rel in temp['labels']:
+                if (rel['h'], rel['t']) not in h_t_dict.keys():
+                    h_t_dict[(rel['h'], rel['t'])] = [rel['r']]
+                else:
+                    h_t_dict[(rel['h'], rel['t'])].append(rel['r'])
+            neg_set = []
+            for i in range(entity_n):
+                for j in range(entity_n):
+                    if i != j and p > np.random.rand():
+                        neg_set.append((i, j))
+            if len(neg_set) > sent_rel_max:
+                np.random.shuffle(neg_set)
+            neg_set = set(neg_set[:sent_rel_max])
+
+            for h_i in range(entity_n):
+                for t_i in range(entity_n):
+                    if h_i != t_i:
+                        if (is_train and ((h_i, t_i) in h_t_dict.keys() or (h_i, t_i) in neg_set)) or is_validation:
+                            h_pos = []
+                            h_map_v = []
+                            h_tok_pos = []
+                            h_tok_map_v = []
+
+                            h_count = Counter([m['type'] for m in temp['vertexSet'][h_i]])
+                            h_count_max = max(h_count.values())
+                            h_type = [w for w in h_count if h_count[w] == h_count_max][0]
+                            h_names = []
+                            h_count = Counter([m['sent_id'] for m in temp['vertexSet'][h_i]])
+                            h_count_max = max(h_count.values())
+                            h_sent_id = [w for w in h_count if h_count[w] == h_count_max][0]
+                            h_sent_pos = (sent_start_pos[h_sent_id], sent_start_pos[h_sent_id + 1])
+
+                            t_pos = []
+                            t_map_v = []
+                            t_tok_pos = []
+                            t_tok_map_v = []
+                            t_count = Counter([m['type'] for m in temp['vertexSet'][t_i]])
+                            t_count_max = max(t_count.values())
+                            t_type = [w for w in t_count if t_count[w] == t_count_max][0]
+                            t_names = []
+                            t_count = Counter([m['sent_id'] for m in temp['vertexSet'][t_i]])
+                            t_count_max = max(t_count.values())
+                            t_sent_id = [w for w in t_count if t_count[w] == t_count_max][0]
+                            t_sent_pos = (sent_start_pos[t_sent_id], sent_start_pos[t_sent_id + 1])
+
+                            delta_dis = temp['vertexSet'][h_i][0]['pos'][0] + \
+                                        sent_start_pos[temp['vertexSet'][h_i][0]['sent_id']] - \
+                                        temp['vertexSet'][t_i][0]['pos'][0] - \
+                                        sent_start_pos[temp['vertexSet'][t_i][0]['sent_id']]
+                            sent_dist = dis2idx[delta_dis] if delta_dis > 0 else -dis2idx[-delta_dis]
+
+                            for h in temp['vertexSet'][h_i]:
+                                for t in temp['vertexSet'][t_i]:
+                                    em1Text = h['name']
+                                    em1_pos = np.array(h['pos']) + sent_start_pos[h['sent_id']]
+                                    em1_pos_num = list(range(em1_pos[0], em1_pos[1]))
+                                    em1_map_value = [1 / len(em1_pos_num) / len(temp['vertexSet'][h_i]) for i in
+                                                     range(em1_pos[1] - em1_pos[0])]
+                                    h_map_v.extend(em1_map_value)
+                                    h_pos.extend(em1_pos_num)
+                                    h_names.append(em1Text)
+                                    em1_tok_pos_num = list(range(min(orig_to_tok_map[em1_pos[0]], max_seq_len),
+                                                                 min(orig_to_tok_map[em1_pos[1]], max_seq_len)))
+                                    h_tok_pos.extend(em1_tok_pos_num)
+                                    h_tok_map_v.extend([1 / len(em1_tok_pos_num) / len(temp['vertexSet'][h_i]) for i in
+                                                        range(len(em1_tok_pos_num))])
+
+                                    em2Text = t['name']
+                                    em2_pos = np.array(t['pos']) + sent_start_pos[t['sent_id']]
+                                    em2_pos_num = list(range(em2_pos[0], em2_pos[1]))
+                                    em2_map_value = [1 / len(em2_pos_num) / len(temp['vertexSet'][t_i]) for i in
+                                                     range(em2_pos[1] - em2_pos[0])]
+                                    t_map_v.extend(em2_map_value)
+                                    t_pos.extend(em2_pos_num)
+                                    t_names.append(em2Text)
+                                    em2_tok_pos_num = list(range(min(orig_to_tok_map[em2_pos[0]], max_seq_len),
+                                                                 min(orig_to_tok_map[em2_pos[1]], max_seq_len)))
+                                    t_tok_pos.extend(em2_tok_pos_num)
+                                    t_tok_map_v.extend([1 / len(em2_tok_pos_num) / len(temp['vertexSet'][t_i]) for i in
+                                                        range(len(em2_tok_pos_num))])
+
+                            labels = h_t_dict[(h_i, t_i)] if (h_i, t_i) in h_t_dict.keys() else ['None']
+                            temp_rel = {'h_pos': h_pos,
+                                        'h_type': h_type,
+                                        'h_index': h_i,
+                                        'h_names': h_names,
+                                        'h_sent_pos': h_sent_pos,
+                                        'h_map_v': h_map_v,
+                                        'h_tok_pos': h_tok_pos,
+                                        'h_tok_map_v': h_tok_map_v,
+                                        't_pos': t_pos,
+                                        't_type': t_type,
+                                        't_index': t_i,
+                                        't_names': t_names,
+                                        't_sent_pos': t_sent_pos,
+                                        't_map_v': t_map_v,
+                                        't_tok_pos': t_tok_pos,
+                                        't_tok_map_v': t_tok_map_v,
+                                        'sent_dist': sent_dist,
+                                        'labels': labels}
+                            rels.append(temp_rel)
+        else:
+            for h_i in range(entity_n):
+                for t_i in range(entity_n):
+                    if h_i != t_i:
+                        h_pos = []
+                        h_map_v = []
+                        h_tok_pos = []
+                        h_tok_map_v = []
+
+                        h_count = Counter([m['type'] for m in temp['vertexSet'][h_i]])
+                        h_count_max = max(h_count.values())
+                        h_type = [w for w in h_count if h_count[w] == h_count_max][0]
+                        h_names = []
+                        h_count = Counter([m['sent_id'] for m in temp['vertexSet'][h_i]])
+                        h_count_max = max(h_count.values())
+                        h_sent_id = [w for w in h_count if h_count[w] == h_count_max][0]
+                        h_sent_pos = (sent_start_pos[h_sent_id], sent_start_pos[h_sent_id + 1])
+
+                        t_pos = []
+                        t_map_v = []
+                        t_tok_pos = []
+                        t_tok_map_v = []
+                        t_count = Counter([m['type'] for m in temp['vertexSet'][t_i]])
+                        t_count_max = max(t_count.values())
+                        t_type = [w for w in t_count if t_count[w] == t_count_max][0]
+                        t_names = []
+                        t_count = Counter([m['sent_id'] for m in temp['vertexSet'][t_i]])
+                        t_count_max = max(t_count.values())
+                        t_sent_id = [w for w in t_count if t_count[w] == t_count_max][0]
+                        t_sent_pos = (sent_start_pos[t_sent_id], sent_start_pos[t_sent_id + 1])
+
+                        delta_dis = temp['vertexSet'][h_i][0]['pos'][0] + \
+                                    sent_start_pos[temp['vertexSet'][h_i][0]['sent_id']] - \
+                                    temp['vertexSet'][t_i][0]['pos'][0] - \
+                                    sent_start_pos[temp['vertexSet'][t_i][0]['sent_id']]
+                        sent_dist = dis2idx[delta_dis] if delta_dis > 0 else -dis2idx[-delta_dis]
+
+                        for h in temp['vertexSet'][h_i]:
+                            for t in temp['vertexSet'][t_i]:
+                                em1Text = h['name']
+                                em1_pos = np.array(h['pos']) + sent_start_pos[h['sent_id']]
+                                em1_pos_num = list(range(em1_pos[0], em1_pos[1]))
+                                em1_map_value = [1 / len(em1_pos_num) / len(temp['vertexSet'][h_i]) for i in
+                                                 range(em1_pos[1] - em1_pos[0])]
+                                h_map_v.extend(em1_map_value)
+                                h_pos.extend(em1_pos_num)
+                                h_names.append(em1Text)
+                                em1_tok_pos_num = list(range(min(orig_to_tok_map[em1_pos[0]], max_seq_len),
+                                                             min(orig_to_tok_map[em1_pos[1]], max_seq_len)))
+                                h_tok_pos.extend(em1_tok_pos_num)
+                                h_tok_map_v.extend([1 / len(em1_tok_pos_num) / len(temp['vertexSet'][h_i]) for i in
+                                                    range(len(em1_tok_pos_num))])
+
+                                em2Text = t['name']
+                                em2_pos = np.array(t['pos']) + sent_start_pos[t['sent_id']]
+                                em2_pos_num = list(range(em2_pos[0], em2_pos[1]))
+                                em2_map_value = [1 / len(em2_pos_num) / len(temp['vertexSet'][t_i]) for i in
+                                                 range(em2_pos[1] - em2_pos[0])]
+                                t_map_v.extend(em2_map_value)
+                                t_pos.extend(em2_pos_num)
+                                t_names.append(em2Text)
+                                em2_tok_pos_num = list(range(min(orig_to_tok_map[em2_pos[0]], max_seq_len),
+                                                             min(orig_to_tok_map[em2_pos[1]], max_seq_len)))
+                                t_tok_pos.extend(em2_tok_pos_num)
+                                t_tok_map_v.extend([1 / len(em2_tok_pos_num) / len(temp['vertexSet'][t_i]) for i in
+                                                    range(len(em2_tok_pos_num))])
+
+                        temp_rel = {'h_pos': h_pos,
+                                    'h_type': h_type,
+                                    'h_index':h_i,
+                                    'h_names': h_names,
+                                    'h_sent_pos': h_sent_pos,
+                                    'h_map_v': h_map_v,
+                                    'h_tok_pos': h_tok_pos,
+                                    'h_tok_map_v': h_tok_map_v,
+                                    't_pos': t_pos,
+                                    't_type': t_type,
+                                    't_index':t_i,
+                                    't_names': t_names,
+                                    't_sent_pos': t_sent_pos,
+                                    't_map_v': t_map_v,
+                                    't_tok_pos': t_tok_pos,
+                                    't_tok_map_v': t_tok_map_v,
+                                    'sent_dist': sent_dist,
+                                    'labels': []}
+                        rels.append(temp_rel)
+
+        if len(rels) > 0:
+            example = InputExample(index=index,
+                                   title=title,
+                                   sent_org_token=sent_org_token,
+                                   sent_coref_id=sent_coref_id,
+                                   sent_ner_id=sent_ner_id,
+                                   input_ids=input_ids,
+                                   input_mask=input_mask,
+                                   input_type_ids=input_type_ids,
+                                   rels=rels[:sent_rel_max])
+            index = example.index
+            title = example.title
+            sent_coref_id = example.sent_coref_id
+            sent_ner_id = example.sent_ner_id
+            sent_org_token = example.sent_org_token
+            rels = example.rels
+            input_ids = example.input_ids
+            input_mask = example.input_mask
+            input_type_ids = example.input_type_ids
+
+            h_pos_nums = []
+            t_pos_nums = []
+            h_pos_relid = []
+            t_pos_relid = []
+            h_map_vs = []
+            t_map_vs = []
+            h_tok_pos_nums = []
+            t_tok_pos_nums = []
+            h_tok_pos_relid = []
+            t_tok_pos_relid = []
+            h_tok_map_vs = []
+            t_tok_map_vs = []
+            label_indexs = []
+            sent_dist = []
+            h_type_indexs = []
+            t_type_indexs = []
+            h_indexs = []
+            t_indexs = []
+            h_sent_pos = []
+            t_sent_pos = []
+            label_relid = []
+
+            for ind, rel in enumerate(rels):
+                h_pos = rel['h_pos']
+                h_pos_nums.extend(h_pos)
+                h_pos_relid.extend([ind for i in range(len(h_pos))])
+                h_map_vs.extend(rel['h_map_v'])
+                t_pos = rel['t_pos']
+                t_pos_nums.extend(t_pos)
+                t_pos_relid.extend([ind for i in range(len(t_pos))])
+                t_map_vs.extend(rel['t_map_v'])
+                h_tok_pos = rel['h_tok_pos']
+                h_tok_pos_nums.extend(h_tok_pos)
+                h_tok_pos_relid.extend([ind for i in range(len(h_tok_pos))])
+                h_tok_map_vs.extend(rel['h_tok_map_v'])
+                t_tok_pos = rel['t_tok_pos']
+                t_tok_pos_nums.extend(t_tok_pos)
+                t_tok_pos_relid.extend([ind for i in range(len(t_tok_pos))])
+                t_tok_map_vs.extend(rel['t_tok_map_v'])
+
+                h_type = rel['h_type']
+                t_type = rel['t_type']
+                h_sent_pos.extend(rel['h_sent_pos'])
+                t_sent_pos.extend(rel['t_sent_pos'])
+                if is_train or is_validation:
+                    labels = rel['labels']
+                    for label in labels:
+                        label_indexs.append(rel_to_ind[label])
+                    label_relid.extend([ind for i in range(len(labels))])
+                h_type_indexs.append(type_to_ind[h_type])
+                t_type_indexs.append(type_to_ind[t_type])
+                h_indexs.append(rel['h_index'])
+                t_indexs.append(rel['t_index'])
+                sent_dist.append(rel['sent_dist'])
+
+            rel_n = [len(rels)]
+            h_pos_n = [len(h_pos_nums)]
+            t_pos_n = [len(t_pos_nums)]
+            h_tok_pos_n = [len(h_tok_pos_nums)]
+            t_tok_pos_n = [len(t_tok_pos_nums)]
+            rel_label_n = [len(label_indexs)]
+
+            if index < 5:
+                tf.logging.info("*** Example ***")
+                tf.logging.info("index: %s" % (example.index))
+                tf.logging.info("title: %s" % (example.title))
+                tf.logging.info("tokens: %s" % " ".join(
+                    [tokenization.printable_text(x) for x in tokens]))
+                tf.logging.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
+                tf.logging.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
+                tf.logging.info(
+                    "input_type_ids: %s" % " ".join([str(x) for x in input_type_ids]))
+                if is_train or is_validation:
+                    tf.logging.info("is train")
+                    tf.logging.info('relation : %s' % ','.join(labels))
+
+            feature = InputFeature(index=index,
+                                   title=title,
+                                   tokens=tokens,
+                                   input_ids=input_ids,
+                                   input_mask=input_mask,
+                                   input_type_ids=input_type_ids,
+                                   h_pos_nums=h_pos_nums,
+                                   t_pos_nums=t_pos_nums,
+                                   h_pos_relid=h_pos_relid,
+                                   t_pos_relid=t_pos_relid,
+                                   h_map_vs=h_map_vs,
+                                   t_map_vs=t_map_vs,
+                                   h_tok_pos_nums=h_tok_pos_nums,
+                                   t_tok_pos_nums=t_tok_pos_nums,
+                                   h_tok_pos_relid=h_tok_pos_relid,
+                                   t_tok_pos_relid=t_tok_pos_relid,
+                                   h_tok_map_vs=h_tok_map_vs,
+                                   t_tok_map_vs=t_tok_map_vs,
+                                   h_pos_n=h_pos_n,
+                                   t_pos_n=t_pos_n,
+                                   h_tok_pos_n=h_tok_pos_n,
+                                   t_tok_pos_n=t_tok_pos_n,
+                                   label_indexs=label_indexs,
+                                   label_relid=label_relid,
+                                   rel_label_n=rel_label_n,
+                                   h_type_indexs=h_type_indexs,
+                                   t_type_indexs=t_type_indexs,
+                                   h_indexs=h_indexs,
+                                   t_indexs=t_indexs,
+                                   h_sent_pos=h_sent_pos,
+                                   t_sent_pos=t_sent_pos,
+                                   sent_coref_id=sent_coref_id,
+                                   sent_ner_id=sent_ner_id,
+                                   sent_dist=sent_dist,
+                                   rel_n=rel_n)
+            output_fn(feature)
+    print('***** feature transformation complete *****')
+
+
+class FeatureWriter(object):
+    """Writes InputFeature to TF example file."""
+
+    def __init__(self, filename, is_training, max_label_n):
+        self.filename = filename
+        self.is_training = is_training
+        self.max_label_n = max_label_n
+        self.num_features = 0
+        self._writer = tf.python_io.TFRecordWriter(filename)
+
+    def process_feature(self, feature):
+        """Write a InputFeature to the TFRecordWriter as a tf.train.Example."""
+        max_label_n = self.max_label_n
+        self.num_features += 1
+
+        def create_int_feature(values):
+            feature = tf.train.Feature(
+                int64_list=tf.train.Int64List(value=list(values)))
+            return feature
+
+        def create_float_feature(values):
+            feature = tf.train.Feature(
+                float_list=tf.train.FloatList(value=list(values)))
+            return feature
+
+        def create_byte_feature(values):
+            feature = tf.train.Feature(bytes_list=tf.train.BytesList(value=[bytes(values,encoding='utf')]))
+            return feature
+
+        features = collections.OrderedDict()
+        features["index"] = create_int_feature([feature.index])
+        features["title"] = create_byte_feature(feature.title)
+
+        features["input_ids"] = create_int_feature(feature.input_ids)
+        features["input_mask"] = create_int_feature(feature.input_mask)
+        features["input_type_ids"] = create_int_feature(feature.input_type_ids)
+
+        features['h_pos_nums'] = create_int_feature(feature.h_pos_nums)
+        features['t_pos_nums'] = create_int_feature(feature.t_pos_nums)
+        features['h_pos_n'] = create_int_feature(feature.h_pos_n)
+        features['t_pos_n'] = create_int_feature(feature.t_pos_n)
+        features['h_pos_relid'] = create_int_feature(feature.h_pos_relid)
+        features['t_pos_relid'] = create_int_feature(feature.t_pos_relid)
+        features['h_map_vs'] = create_float_feature(feature.h_map_vs)
+        features['t_map_vs'] = create_float_feature(feature.t_map_vs)
+        features['h_tok_pos_nums'] = create_int_feature(feature.h_tok_pos_nums)
+        features['t_tok_pos_nums'] = create_int_feature(feature.t_tok_pos_nums)
+        features['h_tok_pos_n'] = create_int_feature(feature.h_tok_pos_n)
+        features['t_tok_pos_n'] = create_int_feature(feature.t_tok_pos_n)
+        features['h_tok_pos_relid'] = create_int_feature(feature.h_tok_pos_relid)
+        features['t_tok_pos_relid'] = create_int_feature(feature.t_tok_pos_relid)
+        features['h_tok_map_vs'] = create_float_feature(feature.h_tok_map_vs)
+        features['t_tok_map_vs'] = create_float_feature(feature.t_tok_map_vs)
+
+        features['h_type_indexs'] = create_int_feature(feature.h_type_indexs)
+        features['t_type_indexs'] = create_int_feature(feature.t_type_indexs)
+        features['h_indexs'] = create_int_feature(feature.h_indexs)
+        features['t_indexs'] = create_int_feature(feature.t_indexs)
+        features['h_sent_pos'] = create_int_feature(feature.h_sent_pos)
+        features['t_sent_pos'] = create_int_feature(feature.t_sent_pos)
+        features['sent_coref_id'] = create_int_feature(feature.sent_coref_id)
+        features['sent_ner_id'] = create_int_feature(feature.sent_ner_id)
+        features['sent_dist'] = create_int_feature(feature.sent_dist)
+        features['rel_n'] = create_int_feature(feature.rel_n)
+
+        if self.is_training:
+            features['label_indexs'] = create_int_feature(feature.label_indexs)
+            features['label_relid'] = create_int_feature(feature.label_relid)
+            features['rel_label_n'] = create_int_feature(feature.rel_label_n)
+
+        tf_example = tf.train.Example(features=tf.train.Features(feature=features))
+        self._writer.write(tf_example.SerializeToString())
+
+    def close(self):
+        self._writer.close()
+
+
+def input_fn_builder(input_file, seq_length, is_training, drop_remainder, is_eval=False):
+    """Creates an `input_fn` closure to be passed to TPUEstimator."""
+
+    name_to_features = {
+        "index": tf.FixedLenFeature([], tf.int64),
+        "title": tf.FixedLenFeature([], tf.string),
+        "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
+        "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
+        "input_type_ids": tf.FixedLenFeature([seq_length], tf.int64),
+        "h_pos_nums": tf.VarLenFeature(tf.int64),
+        "t_pos_nums": tf.VarLenFeature(tf.int64),
+        "h_pos_n": tf.FixedLenFeature([], tf.int64),
+        "t_pos_n": tf.FixedLenFeature([], tf.int64),
+        "h_pos_relid": tf.VarLenFeature(tf.int64),
+        "t_pos_relid": tf.VarLenFeature(tf.int64),
+        "h_map_vs": tf.VarLenFeature(tf.float32),
+        "t_map_vs": tf.VarLenFeature(tf.float32),
+        "h_tok_pos_nums": tf.VarLenFeature(tf.int64),
+        "t_tok_pos_nums": tf.VarLenFeature(tf.int64),
+        "h_tok_pos_n": tf.FixedLenFeature([], tf.int64),
+        "t_tok_pos_n": tf.FixedLenFeature([], tf.int64),
+        "h_tok_pos_relid": tf.VarLenFeature(tf.int64),
+        "t_tok_pos_relid": tf.VarLenFeature(tf.int64),
+        "h_tok_map_vs": tf.VarLenFeature(tf.float32),
+        "t_tok_map_vs": tf.VarLenFeature(tf.float32),
+        "h_type_indexs": tf.VarLenFeature(tf.int64),
+        "t_type_indexs": tf.VarLenFeature(tf.int64),
+        "h_indexs": tf.VarLenFeature(tf.int64),
+        "t_indexs": tf.VarLenFeature(tf.int64),
+        "h_sent_pos": tf.VarLenFeature(tf.int64),
+        "t_sent_pos": tf.VarLenFeature(tf.int64),
+        "sent_coref_id": tf.FixedLenFeature([token_max_len], tf.int64),
+        "sent_ner_id": tf.FixedLenFeature([token_max_len], tf.int64),
+        "sent_dist": tf.VarLenFeature(tf.int64),
+        "rel_n": tf.FixedLenFeature([], tf.int64),
+    }
+    if is_training or is_eval:
+        name_to_features["label_indexs"] = tf.VarLenFeature(tf.int64)
+        name_to_features["label_relid"] = tf.VarLenFeature(tf.int64)
+        name_to_features["rel_label_n"] = tf.FixedLenFeature([], tf.int64)
+
+    def _decode_record(record, name_to_features):
+        """Decodes a record to a TensorFlow example."""
+        example = tf.parse_single_example(record, name_to_features)
+
+        # tf.Example only supports tf.int64, but the TPU only supports tf.int32.
+        # So cast all int64 to int32.
+        for name in list(example.keys()):
+            t = example[name]
+            if t.dtype == tf.int64:
+                t = tf.to_int32(t)
+            elif t.dtype == tf.string:
+                pass
+            else:
+                t = tf.to_float(t)
+            example[name] = t
+
+        return example
+
+    def input_fn(params):
+        """The actual input function."""
+        batch_size = params["batch_size"]
+        # batch_size = train_batch_size
+        # For training, we want a lot of parallel reading and shuffling.
+        # For eval, we want no shuffling and parallel reading doesn't matter.
+        d = tf.data.TFRecordDataset(input_file, num_parallel_reads=32)
+        if is_training:
+            d = d.repeat()
+            d = d.shuffle(buffer_size=100)
+
+        d = d.map(lambda record: _decode_record(record, name_to_features))
+
+        d = d.batch(batch_size)
+
+        d = d.prefetch(2)
+
+        d = d.make_one_shot_iterator()
+
+        return d.get_next()
+
+    return input_fn
+
+
+def create_model(bert_config, is_training, input_ids, input_mask, input_type_ids,
+                 h_pos_nums, h_pos_relid, h_pos_n, h_map_vs,
+                 t_pos_nums, t_pos_relid, t_pos_n, t_map_vs,
+                 h_tok_pos_nums, h_tok_pos_relid, h_tok_pos_n, h_tok_map_vs,
+                 t_tok_pos_nums, t_tok_pos_relid, t_tok_pos_n, t_tok_map_vs,
+                 h_type_indexs, t_type_indexs,
+                 h_sent_pos, t_sent_pos,
+                 sent_coref_id, sent_ner_id,
+                 sent_dist,
+                 rel_n,
+                 use_one_hot_embeddings):
+    """Creates a classification model."""
+    final_hidden = modeling.AlbertModel(
+        config=bert_config,
+        is_training=is_training,
+        input_ids=input_ids,
+        input_mask=input_mask,
+        token_type_ids=input_type_ids,
+        use_one_hot_embeddings=use_one_hot_embeddings).get_sequence_output()
+
+    batch_size, tok_seq_length, hidden_size = modeling.get_shape_list(final_hidden, expected_rank=3)
+
+    _, seq_length = modeling.get_shape_list(sent_coref_id, expected_rank=2)
+    # m.shape (batch_size,tok_max_len,hidden_size)
+    zero = tf.constant(0, dtype=tf.int32)
+
+    coref_emb_mat = tf.Variable(tf.concat([tf.zeros((1, coref_emb)),
+                                           tf.random_uniform([coref_maxlen - 1, coref_emb],
+                                                             minval=-0.1, maxval=0.1, dtype=tf.float32)], 0))
+    ner_emb_mat = tf.Variable(tf.concat([tf.zeros((1, ner_emb)),
+                                         tf.random_uniform([len(type_to_ind), ner_emb],
+                                                           minval=-0.1, maxval=0.1, dtype=tf.float32)], 0))
+    coref_seq = tf.gather(coref_emb_mat, sent_coref_id)
+    ner_seq = tf.gather(ner_emb_mat, sent_ner_id)
+
+    seq_emb = keras.layers.Bidirectional(
+        keras.layers.CuDNNLSTM(
+            dim_f,
+            return_sequences=True))(tf.concat([
+        coref_seq,
+        ner_seq], axis=2))
+
+    liner_weight = tf.Variable(tf.truncated_normal([2 * dim_f, dim_f], stddev=0.088, dtype=tf.float32))
+    liner_bias = tf.Variable(tf.zeros([dim_f], dtype=tf.float32))
+
+    tok_liner_weight = tf.Variable(tf.truncated_normal([hidden_size, dim[2]], stddev=0.05, dtype=tf.float32))
+    tok_liner_bias = tf.Variable(tf.zeros([dim[2]], dtype=tf.float32))
+
+    head_type_bias = tf.Variable(tf.zeros([type_n, dim_f], dtype=tf.float32))
+    tail_type_bias = tf.Variable(tf.zeros([type_n, dim_f], dtype=tf.float32))
+
+    if is_training:
+        seq_emb = tf.nn.dropout(seq_emb, 0.5, seed=12345)
+
+    seq_emb = tf.nn.relu(tf.nn.bias_add(tf.einsum('ijk,kl->ijl', seq_emb, liner_weight), liner_bias))
+
+    tok_seq_emb = tf.nn.relu(tf.nn.bias_add(tf.einsum('ijk,kl->ijl', final_hidden, tok_liner_weight), tok_liner_bias))
+
+    biliner_weights = tf.Variable(
+        tf.truncated_normal([dim[2] + sent_dist_emb + dim_f,
+                             dim[2] + sent_dist_emb + dim_f,
+                             dim[3]], stddev=0.02, dtype=tf.float32))
+    biliner_bias = tf.Variable(tf.zeros([dim[3]], dtype=tf.float32))
+
+    sent_dist_weights = tf.Variable(
+        tf.random_uniform([max_sents, sent_dist_emb], minval=-0.1, maxval=0.1, dtype=tf.float32))
+
+    dim_concat = dim[3]
+    final_weights = tf.Variable(tf.truncated_normal([dim_concat, max_rel_n], stddev=0.138, dtype=tf.float32))
+    final_bias = tf.Variable(tf.zeros([max_rel_n, ], dtype=tf.float32))
+
+    cond = lambda batch_i, m: batch_i < batch_size
+
+    m_init = tf.zeros((0, max_rel_n))
+
+    # m_init = tf.TensorArray(tf.float32, size=2, dynamic_size=True)
+
+    def body(batch_i, m):
+        h_mask = tf.cast(tf.scatter_nd(tf.concat([
+            tf.expand_dims(tf.slice(h_pos_relid[batch_i], tf.expand_dims(zero, 0), tf.expand_dims(h_pos_n[batch_i], 0)),
+                           1),
+            tf.expand_dims(tf.slice(h_pos_nums[batch_i], tf.expand_dims(zero, 0), tf.expand_dims(h_pos_n[batch_i], 0)),
+                           1)], axis=1),
+            tf.slice(h_map_vs[batch_i], tf.expand_dims(zero, 0), tf.expand_dims(h_pos_n[batch_i], 0)),
+            shape=(rel_n[batch_i], seq_length)), tf.float32)
+        t_mask = tf.cast(tf.scatter_nd(tf.concat([
+            tf.expand_dims(tf.slice(t_pos_relid[batch_i], tf.expand_dims(zero, 0), tf.expand_dims(t_pos_n[batch_i], 0)),
+                           1),
+            tf.expand_dims(tf.slice(t_pos_nums[batch_i], tf.expand_dims(zero, 0), tf.expand_dims(t_pos_n[batch_i], 0)),
+                           1)], axis=1),
+            tf.slice(t_map_vs[batch_i], tf.expand_dims(zero, 0), tf.expand_dims(t_pos_n[batch_i], 0)),
+            shape=(rel_n[batch_i], seq_length)), tf.float32)
+
+        h_temp = tf.matmul(h_mask, seq_emb[batch_i])
+        t_temp = tf.matmul(t_mask, seq_emb[batch_i])
+
+        h_tok_mask = tf.cast(tf.scatter_nd(tf.concat([
+            tf.expand_dims(
+                tf.slice(h_tok_pos_relid[batch_i], tf.expand_dims(zero, 0), tf.expand_dims(h_tok_pos_n[batch_i], 0)),
+                1),
+            tf.expand_dims(
+                tf.slice(h_tok_pos_nums[batch_i], tf.expand_dims(zero, 0), tf.expand_dims(h_tok_pos_n[batch_i], 0)),
+                1)], axis=1),
+            tf.slice(h_tok_map_vs[batch_i], tf.expand_dims(zero, 0), tf.expand_dims(h_tok_pos_n[batch_i], 0)),
+            shape=(rel_n[batch_i], tok_seq_length)), tf.float32)
+        t_tok_mask = tf.cast(tf.scatter_nd(tf.concat([
+            tf.expand_dims(
+                tf.slice(t_tok_pos_relid[batch_i], tf.expand_dims(zero, 0), tf.expand_dims(t_tok_pos_n[batch_i], 0)),
+                1),
+            tf.expand_dims(
+                tf.slice(t_tok_pos_nums[batch_i], tf.expand_dims(zero, 0), tf.expand_dims(t_tok_pos_n[batch_i], 0)),
+                1)], axis=1),
+            tf.slice(t_tok_map_vs[batch_i], tf.expand_dims(zero, 0), tf.expand_dims(t_tok_pos_n[batch_i], 0)),
+            shape=(rel_n[batch_i], tok_seq_length)), tf.float32)
+
+        h_tok_temp = tf.matmul(h_tok_mask, tok_seq_emb[batch_i])
+        t_tok_temp = tf.matmul(t_tok_mask, tok_seq_emb[batch_i])
+
+        temp_head_bias = tf.gather(head_type_bias,
+                                   tf.slice(h_type_indexs[batch_i], tf.expand_dims(zero, 0),
+                                            tf.expand_dims(rel_n[batch_i], 0)))
+
+        temp_tail_bias = tf.gather(tail_type_bias,
+                                   tf.slice(t_type_indexs[batch_i], tf.expand_dims(zero, 0),
+                                            tf.expand_dims(rel_n[batch_i], 0)))
+
+        h_temp = h_temp + temp_head_bias
+        t_temp = t_temp + temp_tail_bias
+
+        ht_dist_temp = tf.gather(sent_dist_weights, tf.slice(sent_dist[batch_i], tf.expand_dims(zero, 0),
+                                                             tf.expand_dims(rel_n[batch_i], 0)) + 10)
+        th_dist_temp = tf.gather(sent_dist_weights, -tf.slice(sent_dist[batch_i], tf.expand_dims(zero, 0),
+                                                              tf.expand_dims(rel_n[batch_i], 0)) + 10)
+
+        sub_temp = tf.nn.selu(
+            tf.nn.bias_add(
+                tf.einsum('ij,ijk->ik',
+                          tf.concat([t_temp, t_tok_temp, th_dist_temp], 1),
+                          tf.einsum('ij,jkl->ikl',
+                                    tf.concat([h_temp, h_tok_temp, ht_dist_temp], 1),
+                                    biliner_weights)),
+                biliner_bias))
+
+        m_temp = tf.nn.bias_add(
+            tf.matmul(
+                sub_temp,
+                final_weights),
+            final_bias)
+
+        m = tf.concat([m, m_temp], axis=0)
+
+        return batch_i + 1, m
+
+    _, vec = tf.while_loop(cond, body, [zero, m_init], shape_invariants=[zero.get_shape(),
+                                                                         tf.TensorShape([None, max_rel_n])])
+
+    logits = tf.reshape(vec, [-1, max_rel_n])
+
+    return logits
+
+
+def model_fn_builder(bert_config, init_checkpoint, learning_rate,
+                     num_train_steps, num_warmup_steps, use_tpu,
+                     use_one_hot_embeddings):
+    """Returns `model_fn` closure for TPUEstimator."""
+
+    def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
+        """The `model_fn` for TPUEstimator."""
+
+        tf.logging.info("*** Features ***")
+        for name in sorted(features.keys()):
+            tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
+
+        index = features["index"]
+        title = features["title"]
+        input_ids = features["input_ids"]
+        input_mask = features["input_mask"]
+        input_type_ids = features["input_type_ids"]
+
+        h_pos_nums = tf.sparse.to_dense(features["h_pos_nums"])
+        t_pos_nums = tf.sparse.to_dense(features["t_pos_nums"])
+        h_pos_relid = tf.sparse.to_dense(features["h_pos_relid"])
+        t_pos_relid = tf.sparse.to_dense(features["t_pos_relid"])
+        h_map_vs = tf.sparse.to_dense(features["h_map_vs"])
+        t_map_vs = tf.sparse.to_dense(features["t_map_vs"])
+        h_pos_n = features["h_pos_n"]
+        t_pos_n = features["t_pos_n"]
+
+        h_tok_pos_nums = tf.sparse.to_dense(features["h_tok_pos_nums"])
+        t_tok_pos_nums = tf.sparse.to_dense(features["t_tok_pos_nums"])
+        h_tok_pos_relid = tf.sparse.to_dense(features["h_tok_pos_relid"])
+        t_tok_pos_relid = tf.sparse.to_dense(features["t_tok_pos_relid"])
+        h_tok_map_vs = tf.sparse.to_dense(features["h_tok_map_vs"])
+        t_tok_map_vs = tf.sparse.to_dense(features["t_tok_map_vs"])
+        h_tok_pos_n = features["h_tok_pos_n"]
+        t_tok_pos_n = features["t_tok_pos_n"]
+
+        h_type_indexs = tf.sparse.to_dense(features["h_type_indexs"])
+        t_type_indexs = tf.sparse.to_dense(features["t_type_indexs"])
+        h_indexs = tf.sparse.to_dense(features["h_indexs"])
+        t_indexs = tf.sparse.to_dense(features["t_indexs"])
+        h_sent_pos = tf.sparse.to_dense(features["h_sent_pos"])
+        t_sent_pos = tf.sparse.to_dense(features["t_sent_pos"])
+        sent_coref_id = features["sent_coref_id"]
+        sent_ner_id = features["sent_ner_id"]
+        sent_dist = tf.sparse.to_dense(features["sent_dist"])
+        rel_n = features["rel_n"]
+
+        is_training = (mode == tf.estimator.ModeKeys.TRAIN)
+
+        logits = create_model(
+            bert_config=bert_config,
+            is_training=is_training,
+            input_ids=input_ids,
+            input_mask=input_mask,
+            input_type_ids=input_type_ids,
+            h_pos_nums=h_pos_nums,
+            h_pos_relid=h_pos_relid,
+            h_pos_n=h_pos_n,
+            h_map_vs=h_map_vs,
+            t_pos_nums=t_pos_nums,
+            t_pos_relid=t_pos_relid,
+            t_pos_n=t_pos_n,
+            t_map_vs=t_map_vs,
+            h_tok_pos_nums=h_tok_pos_nums,
+            h_tok_pos_relid=h_tok_pos_relid,
+            h_tok_pos_n=h_tok_pos_n,
+            h_tok_map_vs=h_tok_map_vs,
+            t_tok_pos_nums=t_tok_pos_nums,
+            t_tok_pos_relid=t_tok_pos_relid,
+            t_tok_pos_n=t_tok_pos_n,
+            t_tok_map_vs=t_tok_map_vs,
+            h_type_indexs=h_type_indexs,
+            t_type_indexs=t_type_indexs,
+            h_sent_pos=h_sent_pos,
+            t_sent_pos=t_sent_pos,
+            sent_coref_id=sent_coref_id,
+            sent_ner_id=sent_ner_id,
+            sent_dist=sent_dist,
+            rel_n=rel_n,
+            use_one_hot_embeddings=use_one_hot_embeddings)
+
+        tvars = tf.trainable_variables()
+
+        initialized_variable_names = {}
+        scaffold_fn = None
+        if init_checkpoint:
+            (assignment_map, initialized_variable_names
+             ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+            if use_tpu:
+
+                def tpu_scaffold():
+                    tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+                    return tf.train.Scaffold()
+
+                scaffold_fn = tpu_scaffold
+            else:
+                tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+
+        tf.logging.info("**** Trainable Variables ****")
+        for var in tvars:
+            init_string = ""
+            if var.name in initialized_variable_names:
+                init_string = ", *INIT_FROM_CKPT*"
+            tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
+                            init_string)
+
+        def compute_loss(logits, rel_labels):
+
+            probs = tf.nn.softmax(logits,axis=-1) + 1e-20
+            #q_tensor = tf.fill(probs.get_shape().as_list(),q_)
+            pq = tf.pow(probs,q_) * rel_labels
+            pq = tf.reduce_max(pq,axis=-1)
+            mul = 10 * (1 + pq * (tf.log(pq) - 1)) / q_
+            loss = tf.reduce_mean(mul)
+            #mul = rel_labels * log_probs
+            #mul = tf.where(tf.equal(rel_labels, 0.0), mul - 1e20, mul)
+            #loss = -tf.reduce_mean(
+            #    tf.reduce_sum(mul, axis=-1))
+            return loss
+
+        def compute_metric_intrain(logits, rel_labels):
+
+            submit_len = tf.reduce_sum(tf.cast(tf.not_equal(tf.arg_max(logits, 1), 0), tf.float32))
+            re_len = tf.reduce_sum(tf.cast(tf.equal(rel_labels[:, 0], 0.0), tf.float32))
+
+            true_label_bool = tf.equal(rel_labels[:, 0], 0.0)
+            true_logits = tf.boolean_mask(logits, true_label_bool)
+            true_probs = tf.nn.softmax(true_logits, axis=-1)
+            true_preds = tf.one_hot(tf.arg_max(true_probs, 1), depth=max_rel_n, dtype=tf.float32)
+            true_rellabels = tf.boolean_mask(rel_labels, true_label_bool)
+
+            correct_re = tf.cast(tf.reduce_sum(tf.count_nonzero(true_preds * true_rellabels, axis=1)), tf.float32)
+
+            precision = correct_re / submit_len
+            recall = correct_re / re_len
+            f1 = 2 * precision * recall / (precision + recall)
+
+            precision_score = tf.reduce_mean(precision)
+            recall_score = tf.reduce_mean(recall)
+            f1s = tf.reduce_mean(f1)
+            return f1s, precision_score, recall_score
+
+        def my_metric_fn(labels, predictions):
+            weights = tf.constant(np.array([[0] + [1 for i in range(max_rel_n - 1)]], dtype=np.int))
+
+            def my_precision(labels, predictions):
+                TP, TP_up = tf.metrics.true_positives(labels, predictions, weights=weights)
+                FP, FP_up = tf.metrics.false_positives(labels, predictions, weights=weights)
+                prec = TP / (TP + FP)
+                prec_up = tf.group(TP_up, FP_up)
+                return prec, prec_up
+
+            def my_f1s(labels, predictions):
+                TP, TP_up = tf.metrics.true_positives(labels, predictions, weights=weights)
+                FP, FP_up = tf.metrics.false_positives(labels, predictions, weights=weights)
+                FN, FN_up = tf.metrics.false_negatives(labels, predictions, weights=weights)
+
+                f1s = 2 * TP / (2 * TP + FN + FP)
+                f1s_up = tf.group(TP_up, FP_up, FN_up)
+                return f1s, f1s_up
+
+            labels = tf.cast(labels, tf.float32)
+            pred = tf.arg_max(predictions, 1)
+            probs = tf.nn.softmax(predictions, axis=-1)
+            one_hot_pred = tf.one_hot(
+                pred, depth=max_rel_n, dtype=tf.float32)
+
+            return {  # 'acc': tf.metrics.accuracy(label_args, pred),
+                'auc': tf.metrics.auc(labels, probs),
+                'precision': my_precision(labels, one_hot_pred),
+                'recall': tf.metrics.recall(labels, one_hot_pred, weights=weights),
+                'f1 score': my_f1s(labels, one_hot_pred)}
+
+        output_spec = None
+        if mode == tf.estimator.ModeKeys.TRAIN:
+            global_step = tf.train.get_global_step()
+
+            label_indexs = tf.sparse.to_dense(features["label_indexs"])
+            label_relid = tf.sparse.to_dense(features["label_relid"])
+            rel_label_n = features["rel_label_n"]
+
+            cond = lambda batch_i, m: batch_i < train_batch_size
+
+            m_init = tf.zeros((0, max_rel_n))
+
+            def body(batch_i, m):
+
+                m_new = tf.scatter_nd(
+                    tf.concat([tf.expand_dims(tf.slice(label_relid[batch_i], tf.expand_dims(zero, 0),
+                                                       tf.expand_dims(rel_label_n[batch_i], 0)), 1),
+                               tf.expand_dims(tf.slice(label_indexs[batch_i], tf.expand_dims(zero, 0),
+                                                       tf.expand_dims(rel_label_n[batch_i], 0)), 1)], axis=1),
+                    tf.ones((rel_label_n[batch_i],), dtype=tf.float32),
+                    [rel_n[batch_i], max_rel_n])
+
+                # m = m.write(batch_i, m_new)
+                m = tf.concat([m, m_new], axis=0)
+
+                return batch_i + 1, m
+
+            zero = tf.constant(0, dtype=tf.int32)
+            _, rel_labels = tf.while_loop(cond, body, [zero, m_init], shape_invariants=[zero.get_shape(),
+                                                                                        tf.TensorShape(
+                                                                                            [None, max_rel_n])])
+            # rel_labels = rel_labels.stack()
+            rel_labels = tf.reshape(rel_labels, [-1, max_rel_n])
+
+            loss = compute_loss(logits, rel_labels)
+            f1s, precision, recall = compute_metric_intrain(logits, rel_labels)
+
+            train_op = optimization.create_optimizer(
+                loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu, optimizer="adamw")
+
+            logging_hook = tf.train.LoggingTensorHook({'loss': loss,
+                                                       'f1s': f1s,
+                                                       'precision': precision,
+                                                       'recall': recall}, every_n_iter=10)
+
+            def host_call_fn(gs, loss, f1s, precision, recall, lr, ce):
+                gs = gs[0]
+                with tf.contrib.summary.create_file_writer(
+                        output_dir,
+                        max_queue=iterations_per_loop).as_default():
+                    with tf.contrib.summary.always_record_summaries():
+                        tf.contrib.summary.scalar('loss', loss[0], step=gs)
+                        tf.contrib.summary.scalar('f1s', f1s[0], step=gs)
+                        tf.contrib.summary.scalar('precision', precision[0], step=gs)
+                        tf.contrib.summary.scalar('recall', recall[0], step=gs)
+                        tf.contrib.summary.scalar('learning_rate', lr[0], step=gs)
+                        tf.contrib.summary.scalar('current_epoch', ce[0], step=gs)
+
+                        return tf.contrib.summary.all_summary_ops()
+
+            current_epoch = (tf.cast(global_step, tf.float32) /
+                             epoach_steps)
+
+            gs_t = tf.reshape(global_step, [1])
+            loss_t = tf.reshape(loss, [1])
+            f1s_t = tf.reshape(f1s, [1])
+            precision_t = tf.reshape(precision, [1])
+            recall_t = tf.reshape(recall, [1])
+            lr_t = tf.reshape(learning_rate, [1])
+            ce_t = tf.reshape(current_epoch, [1])
+
+            host_call = (
+                host_call_fn,
+                [gs_t, loss_t, f1s_t, precision_t, recall_t, lr_t,
+                 ce_t])
+
+            output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+                mode=mode,
+                loss=loss,
+                train_op=train_op,
+                training_hooks={logging_hook},
+                host_call=host_call,
+                scaffold_fn=scaffold_fn)
+        elif mode == tf.estimator.ModeKeys.PREDICT:
+
+            predictions = {
+                "index": index,
+                "title": title,
+                "h_indexs": h_indexs,
+                "t_indexs": t_indexs,
+                "logits": tf.expand_dims(logits, 0),
+            }
+            output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+                mode=mode, predictions=predictions, scaffold_fn=scaffold_fn)
+        elif mode == tf.estimator.ModeKeys.EVAL:
+            label_indexs = tf.sparse.to_dense(features["label_indexs"])
+            label_relid = tf.sparse.to_dense(features["label_relid"])
+            rel_label_n = features["rel_label_n"]
+
+            cond = lambda batch_i, m: batch_i < train_batch_size
+            # m_init = tf.Variable(tf.zeros((0, max_rel_n)), tf.float32)
+            # m_init = tf.TensorArray(tf.float32, size=2, dynamic_size=True)
+            m_init = tf.zeros((0, max_rel_n))
+
+            def body(batch_i, m):
+
+                m_new = tf.scatter_nd(
+                    tf.concat([tf.expand_dims(tf.slice(label_relid[batch_i], tf.expand_dims(zero, 0),
+                                                       tf.expand_dims(rel_label_n[batch_i], 0)), 1),
+                               tf.expand_dims(tf.slice(label_indexs[batch_i], tf.expand_dims(zero, 0),
+                                                       tf.expand_dims(rel_label_n[batch_i], 0)), 1)], axis=1),
+                    tf.ones((rel_label_n[batch_i],), dtype=tf.float32),
+                    [rel_n[batch_i], max_rel_n])
+
+                # m = m.write(batch_i, m_new)
+                m = tf.concat([m, m_new], axis=0)
+
+                return batch_i + 1, m
+
+            zero = tf.constant(0, dtype=tf.int32)
+            _, rel_labels = tf.while_loop(cond, body, [zero, m_init], shape_invariants=[zero.get_shape(),
+                                                                                        tf.TensorShape(
+                                                                                            [None, max_rel_n])])
+            # rel_labels = rel_labels.stack()
+            rel_labels = tf.reshape(rel_labels, [-1, max_rel_n])
+
+            loss = compute_loss(logits, rel_labels)
+
+            output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+                mode=mode,
+                loss=loss,
+                eval_metrics=(my_metric_fn, [rel_labels, logits]),
+                scaffold_fn=scaffold_fn)
+        else:
+            raise ValueError(
+                "Only TRAIN , PREDICT and EVALUATE modes are supported: %s" % (mode))
+
+        return output_spec
+
+    return model_fn
+
+
+if __name__ is '__main__':
+    train_tfrecord = os.path.join(output_dir, "train.tf_record")
+    max_rel_n = len(rel_to_ind)
+    type_n = len(type_to_ind)
+
+    tf.logging.set_verbosity(tf.logging.INFO)
+
+    bert_config = modeling.AlbertConfig.from_json_file(bert_config_file)
+
+    tf.gfile.MakeDirs(output_dir)
+
+    is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
+
+    run_config = tf.contrib.tpu.RunConfig(
+        master=master,
+        model_dir=output_dir,
+        save_checkpoints_steps=save_checkpoints_steps,
+        session_config=tf.ConfigProto(gpu_options=tf.GPUOptions(allow_growth=True)),
+        tpu_config=tf.contrib.tpu.TPUConfig(
+            iterations_per_loop=iterations_per_loop,
+            num_shards=num_tpu_cores,
+            per_host_input_for_training=is_per_host))
+    num_train_steps = int(
+        train_len / train_batch_size * num_train_epochs)
+    num_warmup_steps = int(num_train_steps * warmup_proportion)
+    epoach_steps = int(
+        train_len / train_batch_size * 1)
+    eval_steps = int(eval_len / eval_batch_size)
+    test_steps = int(test_len / predict_batch_size)
+
+    model_fn = model_fn_builder(
+        bert_config=bert_config,
+        init_checkpoint=init_checkpoint,
+        learning_rate=learning_rate,
+        num_train_steps=num_train_steps,
+        num_warmup_steps=num_warmup_steps,
+        use_tpu=use_tpu,
+        use_one_hot_embeddings=use_tpu)
+
+    # If TPU is not available, this will fall back to normal Estimator on CPU
+    # or GPU.
+
+    estimator = tf.contrib.tpu.TPUEstimator(
+        use_tpu=use_tpu,
+        model_fn=model_fn,
+        config=run_config,
+        train_batch_size=train_batch_size,
+        eval_batch_size=train_batch_size,
+        predict_batch_size=predict_batch_size)
+
+    if do_train:
+        # We write to a temporary file to avoid storing very large constant tensors
+        # in memory.
+
+        if not os.path.exists(train_tfrecord):
+            train_writer = FeatureWriter(
+                filename=train_tfrecord,
+                max_label_n=max_rel_n,
+                is_training=True)
+            read_examples_and_convert_features(train_file, train_writer.process_feature, p=p)
+            train_writer.close()
+
+        tf.logging.info("***** Running training *****")
+        tf.logging.info("  Num orig examples = %d", train_len)
+        tf.logging.info("  Batch size = %d", train_batch_size)
+        tf.logging.info("  Num steps = %d", num_train_steps)
+
+        train_input_fn = input_fn_builder(input_file=train_tfrecord,
+                                          seq_length=max_seq_len,
+                                          is_training=True,
+                                          drop_remainder=True, )
+
+    if do_eval:
+        eval_tfrecord = os.path.join(output_dir, "eval.tf_record")
+        if not os.path.exists(eval_tfrecord):
+            eval_writer = FeatureWriter(
+                filename=eval_tfrecord,
+                max_label_n=max_rel_n,
+                is_training=True)
+
+            read_examples_and_convert_features(eval_file, eval_writer.process_feature, is_train=False,
+                                               is_validation=True)
+            eval_writer.close()
+
+        tf.logging.info("***** Running eval *****")
+        tf.logging.info("  Num orig examples = %d", eval_len)
+        tf.logging.info("  Batch size = %d", predict_batch_size)
+        tf.logging.info("  Num steps = %d", eval_steps)
+
+        eval_input_fn = input_fn_builder(input_file=eval_tfrecord,
+                                         seq_length=max_seq_len,
+                                         is_training=False,
+                                         drop_remainder=False, is_eval=True)
+    if do_train and do_eval:
+        tf.logging.info("***** Runing train_and_eval process *****")
+        tf.estimator.train_and_evaluate(estimator,
+                                        tf.estimator.TrainSpec(train_input_fn,
+                                                               int(epoach_steps * num_train_epochs)),
+                                        tf.estimator.EvalSpec(eval_input_fn, eval_steps, throttle_secs=60))
+    elif do_train:
+        tf.logging.info("***** Runing training process *****")
+        estimator.train(input_fn=train_input_fn,
+                        max_steps=int(epoach_steps * num_train_epochs))
+    elif do_eval:
+        tf.logging.info("***** Runing eval process *****")
+        estimator.evaluate(input_fn=eval_input_fn,
+                           steps=int(eval_steps))
+
+    tf.logging.info('***** train process complete *****')
+
+    if do_predict:
+        test_tfrecord = os.path.join(output_dir, "test.tf_record")
+        if not os.path.exists(test_tfrecord):
+            test_writer = FeatureWriter(
+                filename=test_tfrecord,
+                max_label_n=max_rel_n,
+                is_training=True)
+
+            read_examples_and_convert_features(test_file, test_writer.process_feature, is_train=False,
+                                               is_validation=False)
+            test_writer.close()
+
+        tf.logging.info("***** Running predict *****")
+        tf.logging.info("  Num orig examples = %d", test_len)
+        tf.logging.info("  Batch size = %d", predict_batch_size)
+        tf.logging.info("  Num steps = %d", test_steps)
+
+        test_input_fn = input_fn_builder(input_file=test_tfrecord,
+                                         seq_length=max_seq_len,
+                                         is_training=False,
+                                         drop_remainder=False, )
+
+        # If running eval on the TPU, you will need to specify the number of
+        # steps.
+        output_prediction_file = os.path.join(output_dir, "result.json")
+        datas = []
+        with open(output_prediction_file, 'w') as f:
+            f.truncate()
+            for result in estimator.predict(
+                test_input_fn):
+
+                index = int(result["index"])
+                title = result['title'].decode('utf')
+                h_indexs = result['h_indexs']
+                t_indexs = result['t_indexs']
+                logits = result["logits"]
+                prob = logits - np.max(logits, axis=-1, keepdims=True)
+                prob = np.exp(prob) / np.sum(np.exp(prob), axis=-1, keepdims=True)
+
+                pred = np.argmax(prob, axis=-1)
+                pred = pred.astype(np.int8)
+
+                data = [{"title":title,
+                         "h_idx":int(h_indexs[i_]),
+                         "t_idx":int(t_indexs[i_]),
+                         "r":ind_to_rel[p_],
+                         "evidence":[]}
+                        for i_,p_ in enumerate(pred)if p_!=rel_to_ind['None']]
+                datas.extend(data)
+
+            json.dump(datas,f)
+        print('predict complete!')
+
